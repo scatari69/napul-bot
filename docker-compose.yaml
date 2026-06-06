@@ -1,0 +1,9 @@
+services:
+  deadlock-bot:
+    build: .
+    container_name: deadlock_bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
