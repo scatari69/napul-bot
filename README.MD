@@ -25,4 +25,53 @@
 ```env
 BOT_TOKEN=ваш_токен_от_botfather
 
-### 1. Подготовка
+2. Файлы настройки
+
+Создайте в папке проекта следующие файлы:
+
+Dockerfile:
+Dockerfile
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "bot.py"]
+
+docker-compose.yml:
+YAML
+
+services:
+  deadlock-bot:
+    build: .
+    container_name: deadlock_bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+
+3. Запуск
+
+Выполните команду в терминале:
+Bash
+
+docker-compose up -d --build
+
+Все данные (stats.json, team.json, user_statistics.json) будут сохраняться в подпапке /data, что позволит не терять статистику при перезапуске контейнера.
+🛠 Команды бота
+
+    /addme — Добавиться в список пуляторов.
+
+    /removeme — Удалиться из списка.
+
+    /team — Посмотреть текущий состав команды.
+
+    /tag — Начать сбор (тегнуть всех, кто еще не отметил "+" в текущем сборе).
+
+    /mplus — Создать интерактивный опрос для сбора группы в М+.
+
+    /stats — Посмотреть общую статистику и топ лучших пуляторов.
+
+Разработано для эффективного напула! ⚔️
