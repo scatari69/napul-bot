@@ -488,8 +488,8 @@ async def show_stats(message: types.Message):
     text = (
         f"📊 <b>Общая Статистика:</b>\n\n"
         f"👥 Напуляторов в базе: {team_count}\n"
-        f"🔫 Славик напулял (Пасхалка): {s_count} {get_raz_word(s_count)}\n"
-        f"🔫 Тексер напулял (Пасхалка): {tx_count} {get_raz_word(tx_count)}\n"
+        f"🔫 Славик напулял: {s_count} {get_raz_word(s_count)}\n"
+        f"🔫 Тексер напулял: {tx_count} {get_raz_word(tx_count)}\n"
         f"✅ Напуляторов тегали: {t_count} {get_raz_word(t_count)}\n"
         f"❌ Отказано в напуле: {u_count} {get_raz_word(u_count)}\n"
         f"⚔️ Успешных сборов в М+: {m_count} {get_raz_word(m_count)}\n\n"
