@@ -48,9 +48,12 @@ def load_stats():
                 stats["current_gathering"] = {}
             if "mplus_groups" not in stats:
                 stats["mplus_groups"] = 0
+            if "texxera" not in stats:
+                stats["texxera"] = 0
             return stats
     return {
         "slavik": 0,
+        "texxera": 0,
         "team": 0,
         "unauthorized": 0,
         "last_tag_time": 0.0,
@@ -276,10 +279,11 @@ async def mention_team(message: types.Message):
     current_time = time.time()
 
     is_slavik = (current_user == "@slaanesh")
+    is_texxera = (current_user == "@texxera")
     in_team = (current_user in team_lower)
 
     # 1. Защита от левых пользователей
-    if not is_slavik and not in_team:
+    if not is_slavik and not is_texxera and not in_team:
         stats["unauthorized"] += 1
         save_stats(stats)
         await message.reply("403")
@@ -292,6 +296,15 @@ async def mention_team(message: types.Message):
         count = stats["slavik"]
         word = get_raz_word(count)
         await message.reply(f"Славик напулял (уже {count} {word})")
+        return
+
+    # 2.1 Если Тексер, но НЕ в команде — срабатывает пасхалка
+    if is_texxera and not in_team:
+        stats["texxera"] += 1
+        save_stats(stats)
+        count = stats["texxera"]
+        word = get_raz_word(count)
+        await message.reply(f"Тексер напулял (уже {count} {word})")
         return
 
     # 3. Если пользователь В КОМАНДЕ (включая Славика, если он туда добавился)
@@ -466,6 +479,7 @@ async def show_stats(message: types.Message):
     user_stats = load_user_stats()
     
     s_count = stats.get('slavik', 0)
+    tx_count = stats.get('texxera', 0)
     t_count = stats.get('team', 0)
     u_count = stats.get('unauthorized', 0)
     m_count = stats.get('mplus_groups', 0)
@@ -475,6 +489,7 @@ async def show_stats(message: types.Message):
         f"📊 <b>Общая Статистика:</b>\n\n"
         f"👥 Напуляторов в базе: {team_count}\n"
         f"🔫 Славик напулял (Пасхалка): {s_count} {get_raz_word(s_count)}\n"
+        f"🔫 Тексер напулял (Пасхалка): {tx_count} {get_raz_word(tx_count)}\n"
         f"✅ Напуляторов тегали: {t_count} {get_raz_word(t_count)}\n"
         f"❌ Отказано в напуле: {u_count} {get_raz_word(u_count)}\n"
         f"⚔️ Успешных сборов в М+: {m_count} {get_raz_word(m_count)}\n\n"
