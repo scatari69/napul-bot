@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -40,8 +40,8 @@ COOLDOWN_SECONDS = 60
 # а /tag от постороннего отвечает «403».
 EGG_CHAT_ID = os.getenv("EGG_CHAT_ID", "1179357258").strip()
 
-# Кому доступны админские команды (/clear): список user_id через запятую или
-# пробел. Если пусто — сгодится любой админ чата, но в чате, где админы все,
+# Кому доступны админские команды (/clear, /set): список user_id через запятую
+# или пробел. Если пусто — сгодится любой админ чата, но в чате, где админы все,
 # это не ограничение, поэтому ADMIN_ID и стоит задать.
 ADMIN_IDS = {
     part.strip().lstrip("-")
@@ -51,6 +51,17 @@ ADMIN_IDS = {
 
 ADMIN_WHO = "владельцы бота" if ADMIN_IDS else "админы чата"
 CLEAR_DENY = f"Список сбора чистят только {ADMIN_WHO}. 🚫"
+SET_DENY = f"Настройки меняют только {ADMIN_WHO}. 🚫"
+
+SET_USAGE = (
+    f"⚙️ <b>Настройки чата</b> — меняют только {ADMIN_WHO}\n\n"
+    "<b>Автосбор</b> — ежедневный /tag в заданное время (пояс сервера):\n"
+    "• <code>/set autotag ЧЧ:ММ</code> — включить, напр. <code>/set autotag 20:00</code>\n"
+    "• <code>/set autotag disable</code> — выключить\n\n"
+    "<b>Состав</b>:\n"
+    "• <code>/set team add @ник</code> — добавить игрока\n"
+    "• <code>/set team remove @ник</code> — убрать игрока"
+)
 
 
 def chat_id_variants(value) -> set:
@@ -93,6 +104,7 @@ def new_chat_state():
         "unauthorized": 0,
         "last_tag_time": 0.0,
         "current_gathering": {},
+        "autotag": None,     # "ЧЧ:ММ" — ежедневный автосбор, или None
     }
 
 
@@ -246,6 +258,27 @@ def get_raz_word(count: int) -> str:
         return "раза"
     return "раз"
 
+
+def parse_hhmm(text: str):
+    """'20:00', '9:5' -> '20:00' / '09:05'; мусор -> None."""
+    try:
+        t = datetime.strptime(text.strip(), "%H:%M")
+    except ValueError:
+        return None
+    return f"{t.hour:02d}:{t.minute:02d}"
+
+
+async def broadcast_gathering(chat_id: int, users_to_tag: list, current_gathering: dict):
+    """Тегает игроков пачками по 4 и постит список сбора с кнопками."""
+    for i in range(0, len(users_to_tag), 4):
+        await bot.send_message(chat_id, " ".join(users_to_tag[i:i + 4]))
+    await bot.send_message(
+        chat_id,
+        get_gathering_text(current_gathering),
+        reply_markup=get_keyboard(),
+        parse_mode="HTML",
+    )
+
 # --- Фоновая задача для сброса в 3 часа ночи ---
 async def reset_gathering_at_three_am():
     while True:
@@ -264,6 +297,45 @@ async def reset_gathering_at_three_am():
             await save_state()
 
         print(f"[{datetime.now()}] Все списки опросов автоматически очищены.")
+
+# --- Автосбор: раз в сутки тегаем состав в заданное для чата время ---
+async def fire_autotag(chat_id: int):
+    async with edit_chat(chat_id) as chat:
+        team = list(chat["team"])
+        current_gathering = copy.deepcopy(chat["current_gathering"])
+        users_to_tag = [
+            user for user in team
+            if current_gathering.get(user.lower(), {}).get("vote") != "+"
+        ]
+        # Отмечаем тег, только если реально есть кого звать
+        if users_to_tag:
+            chat["tags"] += 1
+            chat["last_tag_time"] = time.time()
+
+    if not users_to_tag:
+        return  # состав пуст или все уже отметились — не шумим
+
+    try:
+        await bot.send_message(chat_id, "⏰ <b>Автосбор!</b> Пора напуляться.", parse_mode="HTML")
+        await broadcast_gathering(chat_id, users_to_tag, current_gathering)
+    except Exception as e:
+        print(f"Ошибка автотега в чате {chat_id}: {e}")
+
+
+async def autotag_scheduler():
+    """Раз в минуту проверяет, у каких чатов настало время автосбора."""
+    while True:
+        now = datetime.now()
+        # Просыпаемся к началу следующей минуты, чтобы проверять ЧЧ:ММ один раз
+        await asyncio.sleep(max(1.0, 60 - now.second - now.microsecond / 1_000_000))
+
+        hhmm = datetime.now().strftime("%H:%M")
+        async with _state_lock:
+            due = [int(key) for key, chat in _state.get("chats", {}).items()
+                   if chat.get("autotag") == hhmm]
+
+        for chat_id in due:
+            await fire_autotag(chat_id)
 
 # --- Обработчики команд ---
 @dp.message(Command("addme", ignore_mention=True))
@@ -377,18 +449,10 @@ async def mention_team(message: types.Message):
         await message.reply(f"⏳ КД. Подожди еще {mins} мин. {secs} сек.")
         return
 
-    for i in range(0, len(users_to_tag), 4):
-        chunk = users_to_tag[i:i+4]
-        await message.answer(" ".join(chunk))
-
     if not users_to_tag:
         await message.answer("Все игроки уже подписались! 🔥")
 
-    await message.answer(
-        get_gathering_text(current_gathering),
-        reply_markup=get_keyboard(),
-        parse_mode="HTML"
-    )
+    await broadcast_gathering(chat_id, users_to_tag, current_gathering)
 
 @dp.message(Command("clear", ignore_mention=True))
 async def clear_gathering(message: types.Message):
@@ -407,6 +471,87 @@ async def clear_gathering(message: types.Message):
         await message.reply("🧹 Список плюсов и минусов очищен. Можно собираться заново!")
     else:
         await message.reply("Список и так пуст. 🤔")
+
+@dp.message(Command("set", ignore_mention=True))
+async def set_config(message: types.Message, command: CommandObject):
+    if not await is_admin(message):
+        await message.reply(SET_DENY)
+        return
+
+    args = (command.args or "").split()
+    section = args[0].lower() if args else ""
+    rest = args[1:]
+
+    if section == "autotag":
+        await set_autotag(message, rest)
+    elif section == "team":
+        await set_team(message, rest)
+    else:
+        await message.answer(SET_USAGE, parse_mode="HTML")
+
+
+async def set_autotag(message: types.Message, rest: list):
+    chat_id = message.chat.id
+
+    if not rest:
+        chat = await read_chat(chat_id)
+        cur = chat.get("autotag")
+        if cur:
+            await message.reply(
+                f"⏰ Автосбор включен на {cur} (по времени сервера).\n"
+                "Выключить: <code>/set autotag disable</code>", parse_mode="HTML")
+        else:
+            await message.reply(
+                "Автосбор выключен.\nВключить: <code>/set autotag ЧЧ:ММ</code>", parse_mode="HTML")
+        return
+
+    if rest[0].lower() in ("disable", "off", "выкл", "выключить", "0"):
+        async with edit_chat(chat_id) as chat:
+            was = chat.get("autotag")
+            chat["autotag"] = None
+        await message.reply("⏰ Автосбор выключен." if was else "Автосбор и так был выключен. 🤔")
+        return
+
+    hhmm = parse_hhmm(rest[0])
+    if not hhmm:
+        await message.reply(
+            "Неверное время. Формат ЧЧ:ММ, напр. <code>/set autotag 20:00</code>.", parse_mode="HTML")
+        return
+
+    async with edit_chat(chat_id) as chat:
+        chat["autotag"] = hhmm
+    await message.reply(
+        f"⏰ Автосбор включен на {hhmm} (по времени сервера). "
+        "Каждый день бот сам тегнет тех, кто еще не отметил «+».")
+
+
+async def set_team(message: types.Message, rest: list):
+    op = rest[0].lower() if rest else ""
+    nick = rest[1].lstrip("@") if len(rest) > 1 else ""
+
+    if op not in ("add", "remove", "rm", "del") or not nick:
+        await message.answer(SET_USAGE, parse_mode="HTML")
+        return
+
+    user = f"@{nick}"
+    chat_id = message.chat.id
+
+    if op == "add":
+        async with edit_chat(chat_id) as chat:
+            exists = any(u.lower() == user.lower() for u in chat["team"])
+            if not exists:
+                chat["team"].append(user)
+        await message.reply(
+            f"{user} уже в списке игроков. 🔥" if exists
+            else f"{user} добавлен в список игроков. ⚔️")
+    else:
+        async with edit_chat(chat_id) as chat:
+            new_team = [u for u in chat["team"] if u.lower() != user.lower()]
+            removed = len(new_team) != len(chat["team"])
+            chat["team"] = new_team
+        await message.reply(
+            f"{user} убран из списка игроков. 🫡" if removed
+            else f"{user} и так нет в списке. 🤔")
 
 # --- Обработчики кнопок (callback) ---
 async def answer_callback(callback: types.CallbackQuery, text: str, show_alert: bool = False):
@@ -537,6 +682,7 @@ async def show_stats(message: types.Message):
 async def main():
     load_state()
     asyncio.create_task(reset_gathering_at_three_am())
+    asyncio.create_task(autotag_scheduler())
     # Копившиеся за простой апдейты выбрасываем: отвечать на нажатия,
     # сделанные во время перезапуска, Telegram уже не позволит
     await dp.start_polling(bot, drop_pending_updates=True)
