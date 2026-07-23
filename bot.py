@@ -47,12 +47,12 @@ ADMIN_IDS = {
     if part.strip()
 }
 
-if ADMIN_IDS:
-    EGG_ADMIN_TITLE = "только для владельцев бота"
-    EGG_ADMIN_DENY = "Пасхалками управляют только владельцы бота. 🚫"
-else:
-    EGG_ADMIN_TITLE = "только для админов чата"
-    EGG_ADMIN_DENY = "Пасхалками управляют только админы чата. 🚫"
+ADMIN_WHO, ADMIN_WHO_GEN = (("владельцы бота", "владельцев бота") if ADMIN_IDS
+                            else ("админы чата", "админов чата"))
+
+EGG_ADMIN_TITLE = f"только для {ADMIN_WHO_GEN}"
+EGG_ADMIN_DENY = f"Пасхалками управляют только {ADMIN_WHO}. 🚫"
+CLEAR_DENY = f"Список сбора чистят только {ADMIN_WHO}. 🚫"
 
 
 def chat_id_variants(value) -> set:
@@ -124,7 +124,7 @@ def ensure_egg(chat: dict, user: types.User) -> dict:
     return egg
 
 
-async def can_manage_eggs(message: types.Message) -> bool:
+async def is_admin(message: types.Message) -> bool:
     """Заданный ADMIN_ID перекрывает проверку прав в чате: там, где админы все,
     она никого не отсекает."""
     if ADMIN_IDS:
@@ -378,7 +378,7 @@ async def manage_eggs(message: types.Message, command: CommandObject):
         await message.answer(EGG_USAGE, parse_mode="HTML")
         return
 
-    if not await can_manage_eggs(message):
+    if not await is_admin(message):
         await message.reply(EGG_ADMIN_DENY)
         return
 
@@ -496,6 +496,24 @@ async def mention_team(message: types.Message):
         reply_markup=get_keyboard(),
         parse_mode="HTML"
     )
+
+@dp.message(Command("clear", ignore_mention=True))
+async def clear_gathering(message: types.Message):
+    """Ручная версия ночного сброса: чистит список плюсов и минусов до 03:00."""
+    if not await is_admin(message):
+        await message.reply(CLEAR_DENY)
+        return
+
+    async with edit_chat(message.chat.id) as chat:
+        had_votes = bool(chat["current_gathering"])
+        chat["current_gathering"] = {}
+        # Заодно снимаем КД: список чистят, чтобы сразу начать сбор заново
+        chat["last_tag_time"] = 0.0
+
+    if had_votes:
+        await message.reply("🧹 Список плюсов и минусов очищен. Можно собираться заново!")
+    else:
+        await message.reply("Список и так пуст. 🤔")
 
 # --- Обработчики кнопок (callback) ---
 @dp.callback_query(F.data.in_({"vote_plus", "vote_minus"}))
