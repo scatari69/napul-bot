@@ -38,6 +38,22 @@ COOLDOWN_SECONDS = 60
 # Чат, в котором работают пасхалки. В остальных чатах /egg и счетчики выключены.
 EGG_CHAT_ID = os.getenv("EGG_CHAT_ID", "1179357258").strip()
 
+# Кому можно управлять пасхалками: список user_id через запятую или пробел.
+# Если пусто — сгодится любой админ чата, но в чате, где админы все, это
+# не ограничение, поэтому ADMIN_ID и стоит задать.
+ADMIN_IDS = {
+    part.strip().lstrip("-")
+    for part in os.getenv("ADMIN_ID", "").replace(",", " ").split()
+    if part.strip()
+}
+
+if ADMIN_IDS:
+    EGG_ADMIN_TITLE = "только для владельцев бота"
+    EGG_ADMIN_DENY = "Пасхалками управляют только владельцы бота. 🚫"
+else:
+    EGG_ADMIN_TITLE = "только для админов чата"
+    EGG_ADMIN_DENY = "Пасхалками управляют только админы чата. 🚫"
+
 
 def chat_id_variants(value) -> set:
     """Одна и та же группа записывается по-разному: 1179357258, -1179357258,
@@ -106,6 +122,14 @@ def ensure_egg(chat: dict, user: types.User) -> dict:
         egg = {"name": name, "count": adopt_legacy_counter(chat, name)}
         chat["eggs"][key] = egg
     return egg
+
+
+async def can_manage_eggs(message: types.Message) -> bool:
+    """Заданный ADMIN_ID перекрывает проверку прав в чате: там, где админы все,
+    она никого не отсекает."""
+    if ADMIN_IDS:
+        return str(message.from_user.id) in ADMIN_IDS
+    return await is_chat_admin(message)
 
 
 async def is_chat_admin(message: types.Message) -> bool:
@@ -300,7 +324,7 @@ async def who_am_i(message: types.Message):
                         parse_mode="HTML")
 
 EGG_USAGE = (
-    "🥚 <b>Управление пасхалками</b> (только для админов чата)\n\n"
+    f"🥚 <b>Управление пасхалками</b> ({EGG_ADMIN_TITLE})\n\n"
     "Пасхалки заводятся сами: любой, кого нет в составе, получает личный "
     "счетчик при первом <code>/tag</code>. Руками — только чтобы переименовать "
     "или убрать.\n\n"
@@ -354,8 +378,8 @@ async def manage_eggs(message: types.Message, command: CommandObject):
         await message.answer(EGG_USAGE, parse_mode="HTML")
         return
 
-    if not await is_chat_admin(message):
-        await message.reply("Пасхалками управляют только админы чата. 🚫")
+    if not await can_manage_eggs(message):
+        await message.reply(EGG_ADMIN_DENY)
         return
 
     # Цель — либо явный user_id аргументом, либо автор сообщения, на которое ответили
