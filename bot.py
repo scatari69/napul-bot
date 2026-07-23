@@ -34,7 +34,6 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 COOLDOWN_SECONDS = 60
-MPLUS_TIMEOUT_SECONDS = 600  # 10 минут таймаут для М+
 
 # Чат, в котором работают пасхалки. В остальных чатах /egg и счетчики выключены.
 EGG_CHAT_ID = os.getenv("EGG_CHAT_ID", "1179357258").strip()
@@ -62,8 +61,6 @@ LEGACY_EGG_FIELDS = {
     "texxera": "texxera",
 }
 
-current_mplus = {}
-
 # --- Хранилище ---
 # Всё состояние держим в памяти под одним локом и пишем на диск атомарно,
 # чтобы одновременные нажатия кнопок не затирали правки друг друга.
@@ -80,7 +77,6 @@ def new_chat_state():
         "texxera": 0,
         "tags": 0,
         "unauthorized": 0,
-        "mplus_groups": 0,
         "last_tag_time": 0.0,
         "current_gathering": {},
     }
@@ -88,6 +84,28 @@ def new_chat_state():
 
 def eggs_enabled(chat_id: int) -> bool:
     return bool(chat_id_variants(chat_id) & EGG_CHAT_VARIANTS)
+
+
+def adopt_legacy_counter(chat: dict, name: str) -> int:
+    """Забирает счетчик прежней захардкоженной пасхалки с тем же именем."""
+    field = LEGACY_EGG_FIELDS.get(name.lower())
+    if not field or chat.get(field, 0) <= 0:
+        return 0
+    adopted = chat[field]
+    chat[field] = 0
+    return adopted
+
+
+def ensure_egg(chat: dict, user: types.User) -> dict:
+    """Пасхалка на каждого не-игрока: счетчик заводится сам при первом /tag.
+    Привязка к user_id, а не к @username, — ник можно сменить, id остается."""
+    key = str(user.id)
+    egg = chat["eggs"].get(key)
+    if egg is None:
+        name = user.first_name or user.username or f"id{user.id}"
+        egg = {"name": name, "count": adopt_legacy_counter(chat, name)}
+        chat["eggs"][key] = egg
+    return egg
 
 
 async def is_chat_admin(message: types.Message) -> bool:
@@ -130,7 +148,6 @@ def _collect_legacy():
         chat["texxera"] = old_stats.get("texxera", 0)
         chat["tags"] = old_stats.get("team", 0)
         chat["unauthorized"] = old_stats.get("unauthorized", 0)
-        chat["mplus_groups"] = old_stats.get("mplus_groups", 0)
         chat["last_tag_time"] = old_stats.get("last_tag_time", 0.0)
         chat["current_gathering"] = old_stats.get("current_gathering", {})
     return chat
@@ -224,57 +241,7 @@ async def reset_gathering_at_three_am():
                 chat["current_gathering"] = {}
             await save_state()
 
-        current_mplus.clear()
         print(f"[{datetime.now()}] Все списки опросов автоматически очищены.")
-
-# --- Автоочистка группы М+ по таймауту ---
-async def mplus_timeout_checker(chat_id: int, initiator: str, message_id: int):
-    await asyncio.sleep(MPLUS_TIMEOUT_SECONDS)
-
-    if chat_id in current_mplus and initiator in current_mplus[chat_id]:
-        chat_data = current_mplus[chat_id][initiator]
-
-        if chat_data.get("message_id") == message_id:
-            try:
-                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⌛ Время вышло. Группа от @{chat_data['initiator_display']} в М+ не была собрана."
-                )
-            except Exception as e:
-                print(f"Ошибка при таймауте: {e}")
-            finally:
-                current_mplus[chat_id].pop(initiator, None)
-
-# --- Функции для М+ опроса ---
-def get_mplus_text(chat_data):
-    initiator_display = chat_data.get("initiator_display", "Неизвестно")
-    text = f"🔮 <b>Собираем пати в М+!</b> (Сбор от @{initiator_display})\n\n"
-
-    tanks = chat_data["tank"]
-    heals = chat_data["heal"]
-    dds = chat_data["dd"]
-
-    text += f"🛡️ <b>Танк ({len(tanks)}/1):</b> {tanks[0] if tanks else '—'}\n"
-    text += f"💚 <b>Хил ({len(heals)}/1):</b> {heals[0] if heals else '—'}\n"
-
-    text += f"⚔️ <b>ДД ({len(dds)}/3):</b>\n"
-    if dds:
-        for dd in dds:
-            text += f"  • {dd}\n"
-    else:
-        text += "  • —\n"
-
-    return text
-
-def get_mplus_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🛡️ Танк", callback_data="mp_tank"),
-            InlineKeyboardButton(text="💚 Хил", callback_data="mp_heal"),
-            InlineKeyboardButton(text="⚔️ ДД", callback_data="mp_dd")
-        ]
-    ])
 
 # --- Обработчики команд ---
 @dp.message(Command("addme", ignore_mention=True))
@@ -334,6 +301,9 @@ async def who_am_i(message: types.Message):
 
 EGG_USAGE = (
     "🥚 <b>Управление пасхалками</b> (только для админов чата)\n\n"
+    "Пасхалки заводятся сами: любой, кого нет в составе, получает личный "
+    "счетчик при первом <code>/tag</code>. Руками — только чтобы переименовать "
+    "или убрать.\n\n"
     "• <code>/egg list</code> — показать все пасхалки\n"
     "• <code>/egg add Имя</code> — в ответ на сообщение нужного человека\n"
     "• <code>/egg add &lt;user_id&gt; Имя</code> — если человек сейчас не пишет\n"
@@ -365,7 +335,8 @@ async def manage_eggs(message: types.Message, command: CommandObject):
                 lines.append(f"• {name} — <code>{user_id}</code>, "
                              f"{egg['count']} {get_raz_word(egg['count'])}")
         else:
-            lines.append("Пока ни одной. Добавь через <code>/egg add Имя</code>.")
+            lines.append("Пока ни одной — появятся сами, когда <code>/tag</code> "
+                         "позовет кто-нибудь не из состава.")
 
         unclaimed = [(title, chat.get(field, 0))
                      for title, field in (("Славик", "slavik"), ("Тексер", "texxera"))
@@ -421,13 +392,8 @@ async def manage_eggs(message: types.Message, command: CommandObject):
         existing = chat["eggs"].get(target_id)
         count = existing["count"] if existing else 0
 
-        # Забираем счетчик старой пасхалки с тем же именем
-        legacy_field = LEGACY_EGG_FIELDS.get(name.lower())
-        adopted = 0
-        if legacy_field and chat.get(legacy_field, 0) > 0:
-            adopted = chat[legacy_field]
-            count += adopted
-            chat[legacy_field] = 0
+        adopted = adopt_legacy_counter(chat, name)
+        count += adopted
 
         chat["eggs"][target_id] = {"name": name, "count": count}
 
@@ -438,73 +404,25 @@ async def manage_eggs(message: types.Message, command: CommandObject):
         text += f"\nСчетчик сохранен: {count} {get_raz_word(count)}."
     await message.reply(text, parse_mode="HTML")
 
-@dp.message(Command("mplus", ignore_mention=True))
-async def start_mplus(message: types.Message):
-    if not message.from_user.username:
-        await message.reply("Для использования команды нужен @username в Telegram!")
-        return
-
-    chat_id = message.chat.id
-    current_time = time.time()
-    initiator = f"@{message.from_user.username}".lower()
-    initiator_display = message.from_user.username
-
-    if chat_id not in current_mplus:
-        current_mplus[chat_id] = {}
-
-    if initiator in current_mplus[chat_id]:
-        chat_data = current_mplus[chat_id][initiator]
-        time_since_start = current_time - chat_data.get("start_time", 0)
-
-        if time_since_start < MPLUS_TIMEOUT_SECONDS:
-            remaining = int(MPLUS_TIMEOUT_SECONDS - time_since_start)
-            mins, secs = divmod(remaining, 60)
-            await message.reply(f"⚠️ Ты уже начал сбор! Он будет автоматически закончен через {mins} мин. {secs} сек.")
-            return
-
-    chat_data = {
-        "tank": [],
-        "heal": [],
-        "dd": [],
-        "start_time": current_time,
-        "initiator_display": initiator_display
-    }
-
-    sent_message = await message.answer(
-        get_mplus_text(chat_data),
-        reply_markup=get_mplus_keyboard(),
-        parse_mode="HTML"
-    )
-
-    chat_data["message_id"] = sent_message.message_id
-    current_mplus[chat_id][initiator] = chat_data
-
-    asyncio.create_task(mplus_timeout_checker(chat_id, initiator, sent_message.message_id))
-
 @dp.message(Command("tag", ignore_mention=True))
 async def mention_team(message: types.Message):
-    if not message.from_user.username:
-        return
-
-    current_user = f"@{message.from_user.username}".lower()
+    # Без @username в состав не попасть, а вот пасхалку завести можно — она по user_id
+    username = message.from_user.username
+    current_user = f"@{username}".lower() if username else None
     chat_id = message.chat.id
     current_time = time.time()
 
     async with edit_chat(chat_id) as chat:
         team = list(chat["team"])
-        in_team = current_user in [u.lower() for u in team]
+        in_team = current_user is not None and current_user in [u.lower() for u in team]
 
-        # Пасхалка ищется по user_id, а не по username: ник можно сменить, id — нет
-        egg = None
+        # 1. Не игрок — заводим ему пасхалку (если ее еще нет) и считаем напул
         if not in_team and eggs_enabled(chat_id):
-            egg = chat["eggs"].get(str(message.from_user.id))
-
-        # 1. Пасхалочный пользователь вне команды
-        if egg is not None:
+            egg = ensure_egg(chat, message.from_user)
             egg["count"] += 1
             action, egg_name, count = "egg", egg["name"], egg["count"]
 
-        # 2. Защита от левых пользователей
+        # 2. Защита от левых пользователей там, где пасхалки выключены
         elif not in_team:
             chat["unauthorized"] += 1
             action = "denied"
@@ -556,71 +474,6 @@ async def mention_team(message: types.Message):
     )
 
 # --- Обработчики кнопок (callback) ---
-@dp.callback_query(F.data.startswith("mp_"))
-async def handle_mplus_click(callback: types.CallbackQuery):
-    if not callback.from_user.username:
-        await callback.answer("У тебя нет username!", show_alert=True)
-        return
-
-    chat_id = callback.message.chat.id
-    message_id = callback.message.message_id
-    display_name = callback.from_user.username
-    target_role = callback.data.split("_")[1]
-
-    initiator_key = None
-    if chat_id in current_mplus:
-        for key, data in current_mplus[chat_id].items():
-            if data.get("message_id") == message_id:
-                initiator_key = key
-                break
-
-    if not initiator_key:
-        await callback.answer("Этот сбор уже не актуален!", show_alert=True)
-        return
-
-    chat_data = current_mplus[chat_id][initiator_key]
-
-    if display_name in chat_data[target_role]:
-        chat_data[target_role].remove(display_name)
-        await callback.answer("Вы покинули роль.")
-    else:
-        limit = 1 if target_role in ["tank", "heal"] else 3
-        if len(chat_data[target_role]) >= limit:
-            await callback.answer("Слот для этой роли уже занят!", show_alert=True)
-            return
-
-        for role in ["tank", "heal", "dd"]:
-            if display_name in chat_data[role]:
-                chat_data[role].remove(display_name)
-
-        chat_data[target_role].append(display_name)
-        await callback.answer("Роль успешно выбрана!")
-
-    await callback.message.edit_text(
-        get_mplus_text(chat_data),
-        reply_markup=get_mplus_keyboard(),
-        parse_mode="HTML"
-    )
-
-    if len(chat_data["tank"]) == 1 and len(chat_data["heal"]) == 1 and len(chat_data["dd"]) == 3:
-        await callback.message.edit_reply_markup(reply_markup=None)
-
-        party_list = (
-            f"🛡️ Танк: {chat_data['tank'][0]}\n"
-            f"💚 Хил: {chat_data['heal'][0]}\n"
-            f"⚔️ ДД: {', '.join(chat_data['dd'])}"
-        )
-
-        await callback.message.answer(
-            f"🎉 <b>Группа от @{chat_data['initiator_display']} собрана!</b>\n\n{party_list}",
-            parse_mode="HTML"
-        )
-
-        async with edit_chat(chat_id) as chat:
-            chat["mplus_groups"] += 1
-
-        current_mplus[chat_id].pop(initiator_key, None)
-
 @dp.callback_query(F.data.in_({"vote_plus", "vote_minus"}))
 async def handle_vote(callback: types.CallbackQuery):
     if not callback.from_user.username:
@@ -683,44 +536,49 @@ def get_keyboard():
         ]
     ])
 
+TOP_SIZE = 3
+
+
+def format_top(pairs) -> str:
+    """Топ-3 из пар (имя, счетчик); пустые счетчики в топ не идут."""
+    top = sorted((p for p in pairs if p[1] > 0), key=lambda p: p[1], reverse=True)[:TOP_SIZE]
+    if not top:
+        return "Пока никого нет.\n"
+    return "".join(
+        f"{idx}. {html.escape(name)} — {count} {get_raz_word(count)}\n"
+        for idx, (name, count) in enumerate(top, 1)
+    )
+
+
 @dp.message(Command("stats", ignore_mention=True))
 async def show_stats(message: types.Message):
     chat = await read_chat(message.chat.id)
 
     t_count = chat.get("tags", 0)
     u_count = chat.get("unauthorized", 0)
-    m_count = chat.get("mplus_groups", 0)
     team_count = len(chat.get("team", []))
-    user_stats = chat.get("user_stats", {})
+    eggs = chat.get("eggs", {})
 
     # Зарегистрированные пасхалки + еще не привязанные счетчики старого формата
-    egg_lines = [
-        f"🔫 {html.escape(egg['name'])} напулял: {egg['count']} {get_raz_word(egg['count'])}\n"
-        for egg in sorted(chat.get("eggs", {}).values(), key=lambda e: e["count"], reverse=True)
-    ]
-    for title, field in (("Славик", "slavik"), ("Тексер", "texxera")):
-        count = chat.get(field, 0)
-        if count > 0:
-            egg_lines.append(f"🔫 {title} напулял: {count} {get_raz_word(count)}\n")
+    egg_pairs = [(egg["name"], egg["count"]) for egg in eggs.values()]
+    egg_pairs += [(title, chat.get(field, 0))
+                  for title, field in (("Славик", "slavik"), ("Тексер", "texxera"))]
+
+    # Собачка в юзернейме нужна только для тегов, в топе она лишняя
+    tag_pairs = [(user.replace("@", ""), count)
+                 for user, count in chat.get("user_stats", {}).items()]
 
     text = (
         f"📊 <b>Общая Статистика:</b>\n\n"
         f"👥 Игроков в базе: {team_count}\n"
-        + "".join(egg_lines) +
+        f"🥚 Напулявших в базе: {len(eggs)}\n"
         f"✅ Игроков тегали: {t_count} {get_raz_word(t_count)}\n"
-        f"❌ Отказано в игре: {u_count} {get_raz_word(u_count)}\n"
-        f"⚔️ Успешных сборов в М+: {m_count} {get_raz_word(m_count)}\n\n"
-        f"🏆 <b>Топ игроков:</b>\n"
     )
+    if u_count:
+        text += f"❌ Отказано в игре: {u_count} {get_raz_word(u_count)}\n"
 
-    if user_stats:
-        sorted_users = sorted(user_stats.items(), key=lambda item: item[1], reverse=True)
-        for idx, (username, count) in enumerate(sorted_users, 1):
-            # Убираем собачку из юзернейма для чистого вывода в топе
-            clean_username = username.replace("@", "")
-            text += f"{idx}. {clean_username} — {count} {get_raz_word(count)}\n"
-    else:
-        text += "Пока никого нет.\n"
+    text += "\n🔫 <b>Топ-3 напулявших:</b>\n" + format_top(egg_pairs)
+    text += "\n🏆 <b>Топ-3 тегавших:</b>\n" + format_top(tag_pairs)
 
     await message.answer(text, parse_mode="HTML")
 
