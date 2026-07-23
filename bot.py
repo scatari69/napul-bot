@@ -35,7 +35,6 @@ dp = Dispatcher()
 
 COOLDOWN_SECONDS = 60
 MPLUS_TIMEOUT_SECONDS = 600  # 10 минут таймаут для М+
-TAG_TIMEOUT_SECONDS = 1800   # 30 минут таймаут для очистки списка /tag
 
 # Чат, в котором работают пасхалки. В остальных чатах /egg и счетчики выключены.
 EGG_CHAT_ID = os.getenv("EGG_CHAT_ID", "1179357258").strip()
@@ -228,26 +227,6 @@ async def reset_gathering_at_three_am():
         current_mplus.clear()
         print(f"[{datetime.now()}] Все списки опросов автоматически очищены.")
 
-# --- Автоочистка списка /tag через 30 минут неактивности ---
-async def tag_timeout_checker(chat_id: int):
-    await asyncio.sleep(TAG_TIMEOUT_SECONDS)
-
-    cleared = False
-    async with edit_chat(chat_id) as chat:
-        idle = time.time() - chat.get("last_tag_time", 0.0)
-        if idle >= TAG_TIMEOUT_SECONDS and chat.get("current_gathering"):
-            chat["current_gathering"] = {}
-            cleared = True
-
-    if cleared:
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="⏳ Прошло 30 минут с последнего сбора. Список плюсов и минусов очищен!"
-            )
-        except Exception as e:
-            print(f"Ошибка при отправке сообщения таймаута /tag: {e}")
-
 # --- Автоочистка группы М+ по таймауту ---
 async def mplus_timeout_checker(chat_id: int, initiator: str, message_id: int):
     await asyncio.sleep(MPLUS_TIMEOUT_SECONDS)
@@ -312,9 +291,9 @@ async def add_me(message: types.Message):
             chat["team"].append(user)
 
     if already_in:
-        await message.reply("Ты уже есть в списке напуляторов! 🔥")
+        await message.reply("Ты уже есть в списке игроков! 🔥")
     else:
-        await message.reply("Успешно добавлен в список напуляторов! Бот будет тегать тебя при сборе. ⚔️")
+        await message.reply("Успешно добавлен в список игроков! Бот будет тегать тебя при сборе. ⚔️")
 
 @dp.message(Command("removeme", ignore_mention=True))
 async def remove_me(message: types.Message):
@@ -331,14 +310,14 @@ async def remove_me(message: types.Message):
     if removed:
         await message.reply("Удален из списка. Больше тебя тегать не будут. 🫡")
     else:
-        await message.reply("Тебя и так нет в списке напуляторов. 🤔")
+        await message.reply("Тебя и так нет в списке игроков. 🤔")
 
 @dp.message(Command("team", ignore_mention=True))
 async def show_team(message: types.Message):
     chat = await read_chat(message.chat.id)
     team = chat["team"]
     if not team:
-        await message.answer("Список напуляторов пуст. Добавь себя через /addme")
+        await message.answer("Список игроков пуст. Добавь себя через /addme")
         return
 
     clean_names = [user.replace("@", "") for user in team]
@@ -538,7 +517,7 @@ async def mention_team(message: types.Message):
                 remaining = int(COOLDOWN_SECONDS - time_since_last)
             else:
                 action = "tag"
-                # Засчитываем +1 в топ пуляторов
+                # Засчитываем +1 в топ игроков
                 chat["user_stats"][current_user] = chat["user_stats"].get(current_user, 0) + 1
                 chat["tags"] += 1
                 chat["last_tag_time"] = current_time
@@ -568,15 +547,13 @@ async def mention_team(message: types.Message):
         await message.answer(" ".join(chunk))
 
     if not users_to_tag:
-        await message.answer("Все напуляторы уже подписались! 🔥")
+        await message.answer("Все игроки уже подписались! 🔥")
 
     await message.answer(
         get_gathering_text(current_gathering),
         reply_markup=get_keyboard(),
         parse_mode="HTML"
     )
-
-    asyncio.create_task(tag_timeout_checker(chat_id))
 
 # --- Обработчики кнопок (callback) ---
 @dp.callback_query(F.data.startswith("mp_"))
@@ -685,13 +662,13 @@ async def handle_vote(callback: types.CallbackQuery):
 
 # Очищенная функция без личной статистики
 def get_gathering_text(current_gathering):
-    text = "🚨 <b>Напуляем! Кто идет?</b>\n\n"
+    text = "🚨 <b>Играем! Кто идет?</b>\n\n"
 
     pluses = [data["display"] for data in current_gathering.values() if data["vote"] == "+"]
     minuses = [data["display"] for data in current_gathering.values() if data["vote"] == "-"]
 
     if pluses:
-        text += "✅ <b>Пуляют:</b>\n" + "\n".join(pluses) + "\n\n"
+        text += "✅ <b>Играют:</b>\n" + "\n".join(pluses) + "\n\n"
     if minuses:
         text += "❌ <b>Гейчики:</b>\n" + "\n".join(minuses) + "\n\n"
     if not pluses and not minuses:
@@ -701,7 +678,7 @@ def get_gathering_text(current_gathering):
 def get_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="➕ Пуляю", callback_data="vote_plus"),
+            InlineKeyboardButton(text="➕ Играю", callback_data="vote_plus"),
             InlineKeyboardButton(text="➖ Я ГЕЙ", callback_data="vote_minus")
         ]
     ])
@@ -728,12 +705,12 @@ async def show_stats(message: types.Message):
 
     text = (
         f"📊 <b>Общая Статистика:</b>\n\n"
-        f"👥 Напуляторов в базе: {team_count}\n"
+        f"👥 Игроков в базе: {team_count}\n"
         + "".join(egg_lines) +
-        f"✅ Напуляторов тегали: {t_count} {get_raz_word(t_count)}\n"
-        f"❌ Отказано в напуле: {u_count} {get_raz_word(u_count)}\n"
+        f"✅ Игроков тегали: {t_count} {get_raz_word(t_count)}\n"
+        f"❌ Отказано в игре: {u_count} {get_raz_word(u_count)}\n"
         f"⚔️ Успешных сборов в М+: {m_count} {get_raz_word(m_count)}\n\n"
-        f"🏆 <b>Топ пуляторов:</b>\n"
+        f"🏆 <b>Топ игроков:</b>\n"
     )
 
     if user_stats:
