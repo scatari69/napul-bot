@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -36,23 +36,20 @@ dp = Dispatcher()
 
 COOLDOWN_SECONDS = 60
 
-# Чат, в котором работают пасхалки. В остальных чатах /egg и счетчики выключены.
+# Чат, в котором работают пасхалки. В остальных чатах счетчики выключены,
+# а /tag от постороннего отвечает «403».
 EGG_CHAT_ID = os.getenv("EGG_CHAT_ID", "1179357258").strip()
 
-# Кому можно управлять пасхалками: список user_id через запятую или пробел.
-# Если пусто — сгодится любой админ чата, но в чате, где админы все, это
-# не ограничение, поэтому ADMIN_ID и стоит задать.
+# Кому доступны админские команды (/clear): список user_id через запятую или
+# пробел. Если пусто — сгодится любой админ чата, но в чате, где админы все,
+# это не ограничение, поэтому ADMIN_ID и стоит задать.
 ADMIN_IDS = {
     part.strip().lstrip("-")
     for part in os.getenv("ADMIN_ID", "").replace(",", " ").split()
     if part.strip()
 }
 
-ADMIN_WHO, ADMIN_WHO_GEN = (("владельцы бота", "владельцев бота") if ADMIN_IDS
-                            else ("админы чата", "админов чата"))
-
-EGG_ADMIN_TITLE = f"только для {ADMIN_WHO_GEN}"
-EGG_ADMIN_DENY = f"Пасхалками управляют только {ADMIN_WHO}. 🚫"
+ADMIN_WHO = "владельцы бота" if ADMIN_IDS else "админы чата"
 CLEAR_DENY = f"Список сбора чистят только {ADMIN_WHO}. 🚫"
 
 
@@ -69,8 +66,8 @@ def chat_id_variants(value) -> set:
 
 EGG_CHAT_VARIANTS = chat_id_variants(EGG_CHAT_ID)
 
-# Старые пасхалки были прибиты к username. При регистрации через /egg
-# счетчик с совпадающим именем переезжает на user_id и обнуляется в старом поле.
+# Старые пасхалки были прибиты к username. Когда человек с совпадающим именем
+# впервые зовет /tag, счетчик переезжает на его user_id и обнуляется в старом поле.
 LEGACY_EGG_FIELDS = {
     "славик": "slavik",
     "slavik": "slavik",
@@ -323,111 +320,6 @@ async def who_am_i(message: types.Message):
     target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
     await message.reply(f"user_id: <code>{target.id}</code>\nchat_id: <code>{message.chat.id}</code>",
                         parse_mode="HTML")
-
-EGG_USAGE = (
-    f"🥚 <b>Управление пасхалками</b> ({EGG_ADMIN_TITLE})\n\n"
-    "Пасхалки заводятся сами: любой, кого нет в составе, получает личный "
-    "счетчик при первом <code>/tag</code>. Руками — только чтобы переименовать "
-    "или убрать.\n\n"
-    "• <code>/egg list</code> — показать все пасхалки\n"
-    "• <code>/egg add Имя</code> — в ответ на сообщение нужного человека\n"
-    "• <code>/egg add &lt;user_id&gt; Имя</code> — если человек сейчас не пишет\n"
-    "• <code>/egg del &lt;user_id&gt;</code> — убрать пасхалку\n\n"
-    "user_id можно узнать командой /whoami (в том числе в ответ на сообщение)."
-)
-
-@dp.message(Command("egg", ignore_mention=True))
-async def manage_eggs(message: types.Message, command: CommandObject):
-    if not eggs_enabled(message.chat.id):
-        await message.reply(
-            "В этом чате пасхалки не включены.\n"
-            f"chat_id этого чата: <code>{message.chat.id}</code> — "
-            "укажи его в <code>EGG_CHAT_ID</code>, если пасхалки нужны здесь.",
-            parse_mode="HTML"
-        )
-        return
-
-    args = (command.args or "").split()
-    action = args[0].lower() if args else ""
-
-    if action == "list":
-        chat = await read_chat(message.chat.id)
-        eggs = chat.get("eggs", {})
-        lines = ["🥚 <b>Пасхалки этого чата:</b>\n"]
-        if eggs:
-            for user_id, egg in sorted(eggs.items(), key=lambda i: i[1]["count"], reverse=True):
-                name = html.escape(egg["name"])
-                lines.append(f"• {name} — <code>{user_id}</code>, "
-                             f"{egg['count']} {get_raz_word(egg['count'])}")
-        else:
-            lines.append("Пока ни одной — появятся сами, когда <code>/tag</code> "
-                         "позовет кто-нибудь не из состава.")
-
-        unclaimed = [(title, chat.get(field, 0))
-                     for title, field in (("Славик", "slavik"), ("Тексер", "texxera"))
-                     if chat.get(field, 0) > 0]
-        if unclaimed:
-            lines.append("\n📦 <b>Непривязанные счетчики (старый формат):</b>")
-            for title, count in unclaimed:
-                lines.append(f"• {title} — {count} {get_raz_word(count)}")
-            lines.append("Добавь пасхалку с тем же именем — счетчик переедет на нее.")
-
-        await message.answer("\n".join(lines), parse_mode="HTML")
-        return
-
-    if action not in ("add", "del"):
-        await message.answer(EGG_USAGE, parse_mode="HTML")
-        return
-
-    if not await is_admin(message):
-        await message.reply(EGG_ADMIN_DENY)
-        return
-
-    # Цель — либо явный user_id аргументом, либо автор сообщения, на которое ответили
-    rest = args[1:]
-    target_id = None
-    if rest and rest[0].lstrip("-").isdigit():
-        target_id = rest[0].lstrip("-")
-        rest = rest[1:]
-    elif message.reply_to_message:
-        target_id = str(message.reply_to_message.from_user.id)
-
-    if target_id is None:
-        await message.answer(EGG_USAGE, parse_mode="HTML")
-        return
-
-    if action == "del":
-        async with edit_chat(message.chat.id) as chat:
-            removed = chat["eggs"].pop(target_id, None)
-        if removed:
-            await message.reply(f"Пасхалка «{removed['name']}» убрана.")
-        else:
-            await message.reply("Такой пасхалки тут нет. 🤔")
-        return
-
-    name = " ".join(rest).strip()
-    if not name and message.reply_to_message:
-        replied = message.reply_to_message.from_user
-        name = replied.first_name or replied.username or ""
-    if not name:
-        await message.reply("Укажи имя для пасхалки: <code>/egg add Имя</code>", parse_mode="HTML")
-        return
-
-    async with edit_chat(message.chat.id) as chat:
-        existing = chat["eggs"].get(target_id)
-        count = existing["count"] if existing else 0
-
-        adopted = adopt_legacy_counter(chat, name)
-        count += adopted
-
-        chat["eggs"][target_id] = {"name": name, "count": count}
-
-    text = f"🥚 Пасхалка «{html.escape(name)}» привязана к <code>{target_id}</code>."
-    if adopted:
-        text += f"\nСтарый счетчик перенесен: {adopted} {get_raz_word(adopted)}."
-    elif existing:
-        text += f"\nСчетчик сохранен: {count} {get_raz_word(count)}."
-    await message.reply(text, parse_mode="HTML")
 
 @dp.message(Command("tag", ignore_mention=True))
 async def mention_team(message: types.Message):
