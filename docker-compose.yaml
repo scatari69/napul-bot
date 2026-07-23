@@ -16,5 +16,7 @@ services:
       - EGG_CHAT_ID=${EGG_CHAT_ID:-1179357258}
       # Кто управляет пасхалками; пусто — любой админ чата
       - ADMIN_ID=${ADMIN_ID:-}
+      # Ключ Steam Web API — нужен только для ссылок вида /id/имя в /link
+      - STEAM_API_KEY=${STEAM_API_KEY:-}
       # Часовой пояс: по нему бот сбрасывает списки сбора в 03:00
       - TZ=${TZ:-Europe/Kyiv}

@@ -3,10 +3,13 @@ import copy
 import html
 import os
 import json
+import re
 import sys
 import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
@@ -36,6 +39,15 @@ dp = Dispatcher()
 
 COOLDOWN_SECONDS = 60        # кулдаун /tag по умолчанию, сек
 DEFAULT_RESET_TIME = "03:00" # когда по умолчанию чистится список сбора
+
+# --- Статистика Deadlock через api.deadlock-api.com ---
+# Ключ Steam нужен только чтобы разворачивать vanity-ссылки (steamcommunity.com/id/имя).
+STEAM_API_KEY = os.getenv("STEAM_API_KEY", "").strip()
+STEAMID64_BASE = 76561197960265728  # SteamID64 = account_id + это число
+DEADLOCK_API = "https://api.deadlock-api.com"
+API_TIMEOUT = 12          # сек на запрос к API
+RECENT_MATCHES = 30       # по скольким последним матчам считаем винрейт/KDA
+MH_CACHE_TTL = 900        # match-history тяжелый (~1.5 МБ), держим 15 мин
 
 # Чат, в котором работают пасхалки. В остальных чатах счетчики выключены,
 # а /tag от постороннего отвечает «403».
@@ -112,6 +124,7 @@ def new_chat_state():
         "reset_time": DEFAULT_RESET_TIME,  # "ЧЧ:ММ" — когда чистить список сбора
         "cooldown": COOLDOWN_SECONDS,  # кулдаун /tag, сек
         "gay_stats": {},               # @ник -> сколько раз нажал «Я ГЕЙ»
+        "links": {},                   # user_id -> Deadlock account_id (SteamID3)
     }
 
 
@@ -335,6 +348,208 @@ async def minute_scheduler():
             print(f"[{datetime.now()}] Списки сбора очищены по расписанию ({hhmm}).")
         for chat_id in autotag_due:
             await fire_autotag(chat_id)
+
+# --- Статистика Deadlock ---
+_http_session = None
+_asset_cache = {}   # "ranks"/"heroes" -> {id: name}
+_mh_cache = {}      # account_id -> (expiry_ts, matches)
+
+
+async def _get_session():
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(headers={"User-Agent": "napul-bot"})
+    return _http_session
+
+
+async def api_json(url: str, params: dict = None):
+    """GET JSON; None при любой ошибке или не-200 — вызывающий решает, что сказать."""
+    try:
+        session = await _get_session()
+        async with session.get(url, params=params,
+                               timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as r:
+            if r.status != 200:
+                return None
+            return await r.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"Ошибка запроса {url}: {e}")
+        return None
+
+
+async def _load_asset_names(kind: str) -> dict:
+    """kind: 'ranks' (tier->name) или 'heroes' (id->name). Кэшируется на весь процесс."""
+    if kind not in _asset_cache:
+        data = await api_json(f"{DEADLOCK_API}/v1/assets/{kind}")
+        if not data:
+            return {}
+        key = "tier" if kind == "ranks" else "id"
+        _asset_cache[kind] = {item[key]: item["name"] for item in data}
+    return _asset_cache.get(kind, {})
+
+
+async def resolve_account_id(text: str):
+    """Ссылка Steam / tracklock / голый id -> (account_id, None) либо (None, код_ошибки)."""
+    text = text.strip()
+
+    m = re.search(r"tracklock\.gg/players/(\d+)", text)
+    if m:
+        return int(m.group(1)), None
+
+    m = re.search(r"steamcommunity\.com/profiles/(\d{17})", text)
+    if m:
+        return int(m.group(1)) - STEAMID64_BASE, None
+
+    m = re.search(r"steamcommunity\.com/id/([^/?\s]+)", text)
+    if m:
+        return await _resolve_vanity(m.group(1))
+
+    if text.isdigit():
+        n = int(text)
+        # 17-значный SteamID64 приводим к account_id, короткое число — уже account_id
+        return (n - STEAMID64_BASE if n > STEAMID64_BASE else n), None
+
+    return None, "unknown"
+
+
+async def _resolve_vanity(name: str):
+    if not STEAM_API_KEY:
+        return None, "no_key"
+    data = await api_json(
+        "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/",
+        {"key": STEAM_API_KEY, "vanityurl": name})
+    resp = (data or {}).get("response", {})
+    if resp.get("success") == 1 and resp.get("steamid"):
+        return int(resp["steamid"]) - STEAMID64_BASE, None
+    return None, "vanity_not_found"
+
+
+async def fetch_player_summary(account_id: int):
+    """Дешевые вызовы: текущий ранг (mmr) и Steam-профиль. Любой может быть None."""
+    mmr, steam = await asyncio.gather(
+        api_json(f"{DEADLOCK_API}/v1/players/mmr", {"account_ids": str(account_id)}),
+        api_json(f"{DEADLOCK_API}/v1/players/steam", {"account_ids": str(account_id)}),
+    )
+    return (mmr[0] if mmr else None), (steam[0] if steam else None)
+
+
+async def fetch_recent_stats(account_id: int):
+    """Винрейт/KDA/топ-герой по последним матчам. match-history тяжелый — кэшируем."""
+    now = time.time()
+    cached = _mh_cache.get(account_id)
+    if cached and cached[0] > now:
+        matches = cached[1]
+    else:
+        matches = await api_json(f"{DEADLOCK_API}/v1/players/{account_id}/match-history")
+        if matches is None:
+            return None
+        _mh_cache[account_id] = (now + MH_CACHE_TTL, matches)
+
+    last = matches[:RECENT_MATCHES]
+    if not last:
+        return None
+
+    n = len(last)
+    wins = sum(1 for m in last if m["match_result"] == m["player_team"])
+    top_hero_id = Counter(m["hero_id"] for m in last).most_common(1)[0][0]
+    return {
+        "n": n,
+        "winrate": wins / n * 100,
+        "kills": sum(m["player_kills"] for m in last) / n,
+        "deaths": sum(m["player_deaths"] for m in last) / n,
+        "assists": sum(m["player_assists"] for m in last) / n,
+        "top_hero_id": top_hero_id,
+    }
+
+
+async def render_deadlock_stats(account_id: int) -> str:
+    """Блок статистики Deadlock для /me. Пустая строка, если совсем нет данных."""
+    (mmr, steam), recent = await asyncio.gather(
+        fetch_player_summary(account_id),
+        fetch_recent_stats(account_id),
+    )
+
+    if not mmr and not steam and not recent:
+        return ("\n\n🎮 <b>Deadlock:</b> данных нет — профиль приватный "
+                "или Steam-статистика отключена.")
+
+    lines = ["\n\n🎮 <b>Deadlock</b>"]
+
+    if steam and steam.get("personaname"):
+        lines.append(f"👤 {html.escape(steam['personaname'])}")
+
+    if mmr and mmr.get("division") is not None:
+        ranks = await _load_asset_names("ranks")
+        rank_name = ranks.get(mmr["division"], f"Ранг {mmr['division']}")
+        subrank = mmr.get("division_tier", "")
+        score = mmr.get("player_score")
+        line = f"🏅 {html.escape(rank_name)} {subrank}".rstrip()
+        if score is not None:
+            line += f" ({round(score)})"
+        lines.append(line)
+
+    if recent:
+        heroes = await _load_asset_names("heroes")
+        hero = heroes.get(recent["top_hero_id"], f"#{recent['top_hero_id']}")
+        lines.append(
+            f"📈 За {recent['n']} игр: винрейт {recent['winrate']:.0f}%, "
+            f"KDA {recent['kills']:.1f}/{recent['deaths']:.1f}/{recent['assists']:.1f}")
+        lines.append(f"🦸 Чаще играет: {html.escape(hero)}")
+
+    if steam and steam.get("matches_played_last_30d") is not None:
+        lines.append(f"🗓 Матчей за 30 дней: {steam['matches_played_last_30d']}")
+
+    return "\n".join(lines)
+
+
+LINK_USAGE = (
+    "🔗 <b>Привязка профиля Deadlock</b>\n\n"
+    "Пришли ссылку на свой Steam или tracklock:\n"
+    "• <code>/link https://steamcommunity.com/profiles/7656...</code>\n"
+    "• <code>/link https://steamcommunity.com/id/твой_ник</code>\n"
+    "• <code>/link https://tracklock.gg/players/12345678</code>\n\n"
+    "После привязки статы Deadlock появятся в /me.\n"
+    "Отвязать: <code>/link remove</code>"
+)
+
+
+@dp.message(Command("link", ignore_mention=True))
+async def link_profile(message: types.Message, command: CommandObject):
+    arg = (command.args or "").strip()
+
+    if not arg:
+        await message.reply(LINK_USAGE, parse_mode="HTML")
+        return
+
+    if arg.lower() in ("remove", "del", "delete", "off", "убрать"):
+        async with edit_chat(message.chat.id) as chat:
+            existed = chat["links"].pop(str(message.from_user.id), None)
+        await message.reply("Профиль отвязан." if existed else "У тебя и не было привязки. 🤔")
+        return
+
+    account_id, err = await resolve_account_id(arg)
+    if err == "no_key":
+        await message.reply(
+            "Ссылки вида /id/имя пока не поддержаны. Пришли числовую: "
+            "<code>steamcommunity.com/profiles/7656...</code> "
+            "(открой профиль → «Редактировать» → там виден числовой URL).",
+            parse_mode="HTML")
+        return
+    if err == "vanity_not_found" or (err is None and account_id is None):
+        await message.reply("Не нашел такой Steam-профиль. Проверь ссылку. 🤔")
+        return
+    if account_id is None:
+        await message.reply("Не понял ссылку. Формат — см. /link без аргументов.")
+        return
+
+    mmr, steam = await fetch_player_summary(account_id)
+
+    async with edit_chat(message.chat.id) as chat:
+        chat["links"][str(message.from_user.id)] = account_id
+
+    name = steam.get("personaname") if steam else None
+    who = f" ({html.escape(name)})" if name else ""
+    await message.reply(
+        f"🔗 Профиль привязан{who}. Смотри /me.", parse_mode="HTML")
 
 # --- Обработчики команд ---
 @dp.message(Command("addme", ignore_mention=True))
@@ -772,6 +987,16 @@ async def show_me(message: types.Message):
         lines.append(f"🔫 Напулял: {egg['count']} {get_raz_word(egg['count'])}")
     if gay_count:
         lines.append(f"🌈 Гейнул: {gay_count} {get_raz_word(gay_count)}")
+
+    account_id = chat.get("links", {}).get(str(user.id))
+    if account_id is not None:
+        try:
+            lines.append(await render_deadlock_stats(account_id))
+        except Exception as e:
+            print(f"Ошибка статистики Deadlock для {account_id}: {e}")
+            lines.append("\n\n🎮 <b>Deadlock:</b> не удалось получить статы, попробуй позже.")
+    else:
+        lines.append("\n🎮 Привяжи Steam через /link — покажу статы Deadlock.")
 
     await message.reply("\n".join(lines), parse_mode="HTML")
 
