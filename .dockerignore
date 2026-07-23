@@ -1,0 +1,18 @@
+# Данные бота живут в томе, в образе им делать нечего
+data/
+state.json
+state.json.tmp
+stats.json
+team.json
+user_statistics.json
+
+# Секреты передаются через environment в compose
+.env
+
+__pycache__/
+*.pyc
+
+.git/
+.gitignore
+.claude/
+README.MD
