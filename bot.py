@@ -37,6 +37,34 @@ LEGACY_USER_STATS_FILE = os.path.join(DATA_DIR, "user_statistics.json")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Журнал исходящих сообщений для /cleanup. Telegram не отдает боту список его
+# сообщений, поэтому запоминаем id сами. Только в памяти — на диск не пишем,
+# так что после рестарта чистятся лишь сообщения, отправленные после старта.
+_bot_messages = {}  # chat_id -> [(message_id, unix_ts), ...]
+
+
+def record_bot_message(chat_id: int, message_id: int):
+    now = time.time()
+    log = _bot_messages.setdefault(chat_id, [])
+    log.append((message_id, now))
+    if len(log) > 1:
+        cutoff = now - BOT_MSG_KEEP
+        _bot_messages[chat_id] = [(mid, ts) for mid, ts in log if ts >= cutoff]
+
+
+async def record_outgoing(make_request, called_bot, method):
+    """Middleware сессии: ловит каждое отправленное/отредактированное сообщение."""
+    result = await make_request(called_bot, method)
+    try:
+        if isinstance(result, types.Message):
+            record_bot_message(result.chat.id, result.message_id)
+    except Exception as e:
+        print(f"Не удалось записать сообщение в журнал /cleanup: {e}")
+    return result
+
+
+bot.session.middleware(record_outgoing)
+
 COOLDOWN_SECONDS = 60        # кулдаун /tag по умолчанию, сек
 DEFAULT_RESET_TIME = "03:00" # когда по умолчанию чистится список сбора
 
@@ -65,6 +93,11 @@ ADMIN_IDS = {
 ADMIN_WHO = "владельцы бота" if ADMIN_IDS else "админы чата"
 CLEAR_DENY = f"Список сбора чистят только {ADMIN_WHO}. 🚫"
 SET_DENY = f"Настройки меняют только {ADMIN_WHO}. 🚫"
+CLEANUP_DENY = f"Сообщения бота чистят только {ADMIN_WHO}. 🚫"
+
+CLEANUP_WINDOW = 24 * 3600  # /cleanup удаляет сообщения бота за это время, сек
+BOT_MSG_KEEP = 48 * 3600    # дольше держать в журнале нет смысла: Telegram
+                            # не дает ботам удалять сообщения старше 48 часов
 
 SET_USAGE = (
     f"⚙️ <b>Настройки чата</b> — меняют только {ADMIN_WHO}\n\n"
@@ -686,6 +719,43 @@ async def clear_gathering(message: types.Message):
         await message.reply("🧹 Список плюсов и минусов очищен. Можно собираться заново!")
     else:
         await message.reply("Список и так пуст. 🤔")
+
+@dp.message(Command("cleanup", ignore_mention=True))
+async def cleanup_messages(message: types.Message):
+    """Удаляет сообщения бота за последние сутки (по журналу в памяти)."""
+    if not await is_admin(message):
+        await message.reply(CLEANUP_DENY)
+        return
+
+    chat_id = message.chat.id
+    cutoff = time.time() - CLEANUP_WINDOW
+    log = _bot_messages.get(chat_id, [])
+    to_delete = [mid for mid, ts in log if ts >= cutoff]
+
+    if not to_delete:
+        await message.reply(
+            "Нечего чистить — за сутки бот тут ничего не слал "
+            "(или журнал сбросился после перезапуска). 🤔")
+        return
+
+    deleted = 0
+    failed = 0
+    for mid in to_delete:
+        try:
+            await bot.delete_message(chat_id, mid)
+            deleted += 1
+        except Exception:
+            # старше 48ч, уже удалено или нет прав — пропускаем
+            failed += 1
+
+    # Убираем из журнала все, что пытались удалить (успех или нет)
+    tried = set(to_delete)
+    _bot_messages[chat_id] = [(mid, ts) for mid, ts in log if mid not in tried]
+
+    text = f"🧹 Удалено сообщений бота: {deleted}."
+    if failed:
+        text += f" Не удалось: {failed} (старше 48ч или уже удалены)."
+    await message.reply(text)
 
 @dp.message(Command("set", ignore_mention=True))
 async def set_config(message: types.Message, command: CommandObject):
