@@ -6,7 +6,7 @@ import json
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
@@ -34,7 +34,8 @@ LEGACY_USER_STATS_FILE = os.path.join(DATA_DIR, "user_statistics.json")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-COOLDOWN_SECONDS = 60
+COOLDOWN_SECONDS = 60        # кулдаун /tag по умолчанию, сек
+DEFAULT_RESET_TIME = "03:00" # когда по умолчанию чистится список сбора
 
 # Чат, в котором работают пасхалки. В остальных чатах счетчики выключены,
 # а /tag от постороннего отвечает «403».
@@ -60,7 +61,10 @@ SET_USAGE = (
     "• <code>/set autotag disable</code> — выключить\n\n"
     "<b>Состав</b>:\n"
     "• <code>/set team add @ник</code> — добавить игрока\n"
-    "• <code>/set team remove @ник</code> — убрать игрока"
+    "• <code>/set team remove @ник</code> — убрать игрока\n\n"
+    "<b>Прочее</b>:\n"
+    "• <code>/set cooldown СЕК</code> — кулдаун /tag (0 — выключить)\n"
+    "• <code>/set reset_time ЧЧ:ММ</code> — когда чистить список сбора"
 )
 
 
@@ -104,7 +108,10 @@ def new_chat_state():
         "unauthorized": 0,
         "last_tag_time": 0.0,
         "current_gathering": {},
-        "autotag": None,     # "ЧЧ:ММ" — ежедневный автосбор, или None
+        "autotag": None,               # "ЧЧ:ММ" — ежедневный автосбор, или None
+        "reset_time": DEFAULT_RESET_TIME,  # "ЧЧ:ММ" — когда чистить список сбора
+        "cooldown": COOLDOWN_SECONDS,  # кулдаун /tag, сек
+        "gay_stats": {},               # @ник -> сколько раз нажал «Я ГЕЙ»
     }
 
 
@@ -279,25 +286,6 @@ async def broadcast_gathering(chat_id: int, users_to_tag: list, current_gatherin
         parse_mode="HTML",
     )
 
-# --- Фоновая задача для сброса в 3 часа ночи ---
-async def reset_gathering_at_three_am():
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=3, minute=0, second=0, microsecond=0)
-
-        if now >= target:
-            target += timedelta(days=1)
-
-        sleep_seconds = (target - now).total_seconds()
-        await asyncio.sleep(sleep_seconds)
-
-        async with _state_lock:
-            for chat in _state.get("chats", {}).values():
-                chat["current_gathering"] = {}
-            await save_state()
-
-        print(f"[{datetime.now()}] Все списки опросов автоматически очищены.")
-
 # --- Автосбор: раз в сутки тегаем состав в заданное для чата время ---
 async def fire_autotag(chat_id: int):
     async with edit_chat(chat_id) as chat:
@@ -322,19 +310,30 @@ async def fire_autotag(chat_id: int):
         print(f"Ошибка автотега в чате {chat_id}: {e}")
 
 
-async def autotag_scheduler():
-    """Раз в минуту проверяет, у каких чатов настало время автосбора."""
+async def minute_scheduler():
+    """Раз в минуту: у каждого чата свое время ночной очистки и автосбора."""
     while True:
         now = datetime.now()
         # Просыпаемся к началу следующей минуты, чтобы проверять ЧЧ:ММ один раз
         await asyncio.sleep(max(1.0, 60 - now.second - now.microsecond / 1_000_000))
 
         hhmm = datetime.now().strftime("%H:%M")
+        autotag_due = []
+        cleared = False
         async with _state_lock:
-            due = [int(key) for key, chat in _state.get("chats", {}).items()
-                   if chat.get("autotag") == hhmm]
+            for key, chat in _state.get("chats", {}).items():
+                # Сначала очистка: если совпадет с автосбором, тот увидит пустой список
+                if chat.get("reset_time", DEFAULT_RESET_TIME) == hhmm and chat.get("current_gathering"):
+                    chat["current_gathering"] = {}
+                    cleared = True
+                if chat.get("autotag") == hhmm:
+                    autotag_due.append(int(key))
+            if cleared:
+                await save_state()
 
-        for chat_id in due:
+        if cleared:
+            print(f"[{datetime.now()}] Списки сбора очищены по расписанию ({hhmm}).")
+        for chat_id in autotag_due:
             await fire_autotag(chat_id)
 
 # --- Обработчики команд ---
@@ -418,10 +417,11 @@ async def mention_team(message: types.Message):
 
         # 3. Пользователь В КОМАНДЕ (включая пасхалочных, если они туда добавились)
         else:
+            cooldown = chat.get("cooldown", COOLDOWN_SECONDS)
             time_since_last = current_time - chat.get("last_tag_time", 0.0)
-            if time_since_last < COOLDOWN_SECONDS:
+            if time_since_last < cooldown:
                 action = "cooldown"
-                remaining = int(COOLDOWN_SECONDS - time_since_last)
+                remaining = int(cooldown - time_since_last)
             else:
                 action = "tag"
                 # Засчитываем +1 в топ игроков
@@ -486,6 +486,10 @@ async def set_config(message: types.Message, command: CommandObject):
         await set_autotag(message, rest)
     elif section == "team":
         await set_team(message, rest)
+    elif section == "cooldown":
+        await set_cooldown(message, rest)
+    elif section in ("reset_time", "reset"):
+        await set_reset_time(message, rest)
     else:
         await message.answer(SET_USAGE, parse_mode="HTML")
 
@@ -553,6 +557,52 @@ async def set_team(message: types.Message, rest: list):
             f"{user} убран из списка игроков. 🫡" if removed
             else f"{user} и так нет в списке. 🤔")
 
+
+async def set_cooldown(message: types.Message, rest: list):
+    chat_id = message.chat.id
+
+    if not rest:
+        chat = await read_chat(chat_id)
+        cur = chat.get("cooldown", COOLDOWN_SECONDS)
+        await message.reply(
+            f"Кулдаун /tag: {cur} сек." if cur else "Кулдаун /tag выключен.")
+        return
+
+    if not rest[0].isdigit():
+        await message.reply(
+            "Укажи число секунд: <code>/set cooldown 30</code> (0 — выключить).",
+            parse_mode="HTML")
+        return
+
+    seconds = min(int(rest[0]), 86400)  # больше суток смысла не имеет
+    async with edit_chat(chat_id) as chat:
+        chat["cooldown"] = seconds
+    await message.reply(
+        f"⏳ Кулдаун /tag теперь {seconds} сек." if seconds
+        else "⏳ Кулдаун /tag выключен.")
+
+
+async def set_reset_time(message: types.Message, rest: list):
+    chat_id = message.chat.id
+
+    if not rest:
+        chat = await read_chat(chat_id)
+        await message.reply(
+            f"🧹 Список сбора чистится в {chat.get('reset_time', DEFAULT_RESET_TIME)} "
+            "(по времени сервера).")
+        return
+
+    hhmm = parse_hhmm(rest[0])
+    if not hhmm:
+        await message.reply(
+            "Неверное время. Формат ЧЧ:ММ, напр. <code>/set reset_time 04:00</code>.",
+            parse_mode="HTML")
+        return
+
+    async with edit_chat(chat_id) as chat:
+        chat["reset_time"] = hhmm
+    await message.reply(f"🧹 Список сбора будет чиститься в {hhmm} (по времени сервера).")
+
 # --- Обработчики кнопок (callback) ---
 async def answer_callback(callback: types.CallbackQuery, text: str, show_alert: bool = False):
     """На нажатие Telegram ждет ответа меньше минуты. Кнопки старого сбора и
@@ -583,6 +633,9 @@ async def handle_vote(callback: types.CallbackQuery):
             if user_record and user_record["vote"] == vote:
                 result = "duplicate"
             else:
+                # Вечный счетчик гейства: считаем только новое «−», не дубль
+                if vote == "-":
+                    chat["gay_stats"][current_user] = chat["gay_stats"].get(current_user, 0) + 1
                 # Записываем решение
                 chat["current_gathering"][current_user] = {"display": display_name, "vote": vote}
                 result = "accepted"
@@ -679,10 +732,52 @@ async def show_stats(message: types.Message):
 
     await message.answer(text, parse_mode="HTML")
 
+@dp.message(Command("gaystats", ignore_mention=True))
+async def show_gaystats(message: types.Message):
+    chat = await read_chat(message.chat.id)
+    gay_stats = chat.get("gay_stats", {})
+
+    ranked = sorted(
+        ((user.replace("@", ""), count) for user, count in gay_stats.items() if count > 0),
+        key=lambda p: p[1], reverse=True,
+    )
+    if not ranked:
+        await message.answer("🌈 Пока никто не гейнул. Все настоящие напуляторы! 🔥")
+        return
+
+    lines = ["🌈 <b>Топ гейчиков</b> (нажатий «Я ГЕЙ»):\n"]
+    for idx, (name, count) in enumerate(ranked, 1):
+        lines.append(f"{idx}. {html.escape(name)} — {count} {get_raz_word(count)}")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+@dp.message(Command("me", ignore_mention=True))
+async def show_me(message: types.Message):
+    user = message.from_user
+    username = user.username
+    key = f"@{username}".lower() if username else None
+    chat = await read_chat(message.chat.id)
+
+    in_team = key is not None and key in [u.lower() for u in chat.get("team", [])]
+    tag_count = chat.get("user_stats", {}).get(key, 0) if key else 0
+    gay_count = chat.get("gay_stats", {}).get(key, 0) if key else 0
+    egg = chat.get("eggs", {}).get(str(user.id))
+
+    display = html.escape(user.first_name or username or "Игрок")
+    lines = [
+        f"🪪 <b>{display}</b>",
+        ("✅ В составе" if in_team else "➖ Не в составе (добавься через /addme)"),
+        f"🏆 Тегал: {tag_count} {get_raz_word(tag_count)}",
+    ]
+    if egg:
+        lines.append(f"🔫 Напулял: {egg['count']} {get_raz_word(egg['count'])}")
+    if gay_count:
+        lines.append(f"🌈 Гейнул: {gay_count} {get_raz_word(gay_count)}")
+
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
 async def main():
     load_state()
-    asyncio.create_task(reset_gathering_at_three_am())
-    asyncio.create_task(autotag_scheduler())
+    asyncio.create_task(minute_scheduler())
     # Копившиеся за простой апдейты выбрасываем: отвечать на нажатия,
     # сделанные во время перезапуска, Telegram уже не позволит
     await dp.start_polling(bot, drop_pending_updates=True)
