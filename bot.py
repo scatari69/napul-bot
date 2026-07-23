@@ -742,7 +742,7 @@ async def show_gaystats(message: types.Message):
         key=lambda p: p[1], reverse=True,
     )
     if not ranked:
-        await message.answer("🌈 Пока никто не гейнул. Все настоящие напуляторы! 🔥")
+        await message.answer("🌈 Пока никто не киданул.")
         return
 
     lines = ["🌈 <b>Топ гейчиков</b> (нажатий «Я ГЕЙ»):\n"]
