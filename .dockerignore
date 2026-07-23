@@ -2,6 +2,8 @@
 data/
 state.json
 state.json.tmp
+bot_messages.json
+bot_messages.json.tmp
 stats.json
 team.json
 user_statistics.json

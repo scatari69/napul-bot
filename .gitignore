@@ -4,6 +4,7 @@ __pycache__/
 # Локальные данные бота
 data/
 state.json
+bot_messages.json
 stats.json
 team.json
 user_statistics.json

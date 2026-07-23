@@ -28,6 +28,9 @@ DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+# Журнал исходящих сообщений для /cleanup — отдельно от основного состояния,
+# чтобы частые записи не дергали state.json
+BOT_MESSAGES_FILE = os.path.join(DATA_DIR, "bot_messages.json")
 
 # Файлы старого плоского формата — переносятся в state.json при первом запуске
 LEGACY_STATS_FILE = os.path.join(DATA_DIR, "stats.json")
@@ -38,18 +41,22 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # Журнал исходящих сообщений для /cleanup. Telegram не отдает боту список его
-# сообщений, поэтому запоминаем id сами. Только в памяти — на диск не пишем,
-# так что после рестарта чистятся лишь сообщения, отправленные после старта.
-_bot_messages = {}  # chat_id -> [(message_id, unix_ts), ...]
+# сообщений, поэтому запоминаем id сами. Журнал живет в отдельном файле
+# BOT_MESSAGES_FILE и сбрасывается на диск фоново, чтобы не писать на каждое
+# сообщение. После рестарта поднимаем его обратно.
+_bot_messages = {}       # chat_id -> [(message_id, unix_ts), ...]
+_bot_messages_dirty = False  # есть несохраненные изменения
 
 
 def record_bot_message(chat_id: int, message_id: int):
+    global _bot_messages_dirty
     now = time.time()
     log = _bot_messages.setdefault(chat_id, [])
     log.append((message_id, now))
     if len(log) > 1:
         cutoff = now - BOT_MSG_KEEP
         _bot_messages[chat_id] = [(mid, ts) for mid, ts in log if ts >= cutoff]
+    _bot_messages_dirty = True
 
 
 async def record_outgoing(make_request, called_bot, method):
@@ -64,6 +71,49 @@ async def record_outgoing(make_request, called_bot, method):
 
 
 bot.session.middleware(record_outgoing)
+
+
+def load_bot_messages():
+    """Поднимает журнал с диска, отсеивая записи старше срока хранения."""
+    global _bot_messages
+    data = _read_json(BOT_MESSAGES_FILE, {}) or {}
+    cutoff = time.time() - BOT_MSG_KEEP
+    restored = {}
+    for chat_id, log in data.items():
+        kept = [(int(mid), float(ts)) for mid, ts in log if float(ts) >= cutoff]
+        if kept:
+            restored[int(chat_id)] = kept
+    _bot_messages = restored
+
+
+def _write_bot_messages_sync(data):
+    tmp_path = BOT_MESSAGES_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, BOT_MESSAGES_FILE)
+
+
+async def flush_bot_messages():
+    """Сбрасывает журнал на диск, если были изменения."""
+    global _bot_messages_dirty
+    if not _bot_messages_dirty:
+        return
+    # Снимок строим синхронно (без await) — значит, консистентный
+    snapshot = {str(cid): [[mid, ts] for mid, ts in log]
+                for cid, log in _bot_messages.items() if log}
+    _bot_messages_dirty = False
+    await asyncio.to_thread(_write_bot_messages_sync, snapshot)
+
+
+async def bot_messages_flush_loop():
+    while True:
+        await asyncio.sleep(BOT_MSG_FLUSH_INTERVAL)
+        try:
+            await flush_bot_messages()
+        except OSError as e:
+            print(f"Не удалось сохранить журнал сообщений: {e}")
 
 COOLDOWN_SECONDS = 60        # кулдаун /tag по умолчанию, сек
 DEFAULT_RESET_TIME = "03:00" # когда по умолчанию чистится список сбора
@@ -98,6 +148,7 @@ CLEANUP_DENY = f"Сообщения бота чистят только {ADMIN_WH
 CLEANUP_WINDOW = 24 * 3600  # /cleanup удаляет сообщения бота за это время, сек
 BOT_MSG_KEEP = 48 * 3600    # дольше держать в журнале нет смысла: Telegram
                             # не дает ботам удалять сообщения старше 48 часов
+BOT_MSG_FLUSH_INTERVAL = 60 # как часто сбрасывать журнал на диск, сек
 
 SET_USAGE = (
     f"⚙️ <b>Настройки чата</b> — меняют только {ADMIN_WHO}\n\n"
@@ -749,8 +800,11 @@ async def cleanup_messages(message: types.Message):
             failed += 1
 
     # Убираем из журнала все, что пытались удалить (успех или нет)
+    global _bot_messages_dirty
     tried = set(to_delete)
     _bot_messages[chat_id] = [(mid, ts) for mid, ts in log if mid not in tried]
+    _bot_messages_dirty = True
+    await flush_bot_messages()
 
     text = f"🧹 Удалено сообщений бота: {deleted}."
     if failed:
@@ -1072,7 +1126,9 @@ async def show_me(message: types.Message):
 
 async def main():
     load_state()
+    load_bot_messages()
     asyncio.create_task(minute_scheduler())
+    asyncio.create_task(bot_messages_flush_loop())
     # Копившиеся за простой апдейты выбрасываем: отвечать на нажатия,
     # сделанные во время перезапуска, Telegram уже не позволит
     await dp.start_polling(bot, drop_pending_updates=True)
