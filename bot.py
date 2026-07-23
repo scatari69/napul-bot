@@ -372,13 +372,14 @@ def parse_hhmm(text: str):
     return f"{t.hour:02d}:{t.minute:02d}"
 
 
-async def broadcast_gathering(chat_id: int, users_to_tag: list, current_gathering: dict):
+async def broadcast_gathering(chat_id: int, users_to_tag: list,
+                              current_gathering: dict, links: dict):
     """Тегает игроков пачками по 4 и постит список сбора с кнопками."""
     for i in range(0, len(users_to_tag), 4):
         await bot.send_message(chat_id, " ".join(users_to_tag[i:i + 4]))
     await bot.send_message(
         chat_id,
-        get_gathering_text(current_gathering),
+        await get_gathering_text(current_gathering, links),
         reply_markup=get_keyboard(),
         parse_mode="HTML",
     )
@@ -388,6 +389,7 @@ async def fire_autotag(chat_id: int):
     async with edit_chat(chat_id) as chat:
         team = list(chat["team"])
         current_gathering = copy.deepcopy(chat["current_gathering"])
+        links = dict(chat["links"])
         users_to_tag = [
             user for user in team
             if current_gathering.get(user.lower(), {}).get("vote") != "+"
@@ -402,7 +404,7 @@ async def fire_autotag(chat_id: int):
 
     try:
         await bot.send_message(chat_id, "⏰ <b>Автосбор!</b> Пора напуляться.", parse_mode="HTML")
-        await broadcast_gathering(chat_id, users_to_tag, current_gathering)
+        await broadcast_gathering(chat_id, users_to_tag, current_gathering, links)
     except Exception as e:
         print(f"Ошибка автотега в чате {chat_id}: {e}")
 
@@ -514,6 +516,30 @@ async def fetch_player_summary(account_id: int):
         api_json(f"{DEADLOCK_API}/v1/players/steam", {"account_ids": str(account_id)}),
     )
     return (mmr[0] if mmr else None), (steam[0] if steam else None)
+
+
+_rank_cache = {}          # account_id -> (expiry_ts, rank_str или None)
+RANK_CACHE_TTL = 3600     # ранг меняется медленно, держим час
+
+
+async def get_rank_string(account_id: int):
+    """Короткая строка ранга вида «Eternus 6» для списка сбора. Кэшируется."""
+    now = time.time()
+    cached = _rank_cache.get(account_id)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    mmr = await api_json(f"{DEADLOCK_API}/v1/players/mmr", {"account_ids": str(account_id)})
+    rank_str = None
+    if mmr and mmr[0].get("division") is not None:
+        ranks = await _load_asset_names("ranks")
+        div = mmr[0]["division"]
+        name = ranks.get(div, f"Ранг {div}")
+        sub = mmr[0].get("division_tier", "")
+        rank_str = f"{name} {sub}".strip()
+
+    _rank_cache[account_id] = (now + RANK_CACHE_TTL, rank_str)
+    return rank_str
 
 
 async def fetch_recent_stats(account_id: int):
@@ -729,6 +755,7 @@ async def mention_team(message: types.Message):
                 chat["last_tag_time"] = current_time
 
                 current_gathering = copy.deepcopy(chat["current_gathering"])
+                links = dict(chat["links"])
                 users_to_tag = [
                     user for user in team
                     if current_gathering.get(user.lower(), {}).get("vote") != "+"
@@ -751,7 +778,7 @@ async def mention_team(message: types.Message):
     if not users_to_tag:
         await message.answer("Все игроки уже подписались! 🔥")
 
-    await broadcast_gathering(chat_id, users_to_tag, current_gathering)
+    await broadcast_gathering(chat_id, users_to_tag, current_gathering, links)
 
 @dp.message(Command("clear", ignore_mention=True))
 async def clear_gathering(message: types.Message):
@@ -975,10 +1002,12 @@ async def handle_vote(callback: types.CallbackQuery):
                 # Вечный счетчик гейства: считаем только новое «−», не дубль
                 if vote == "-":
                     chat["gay_stats"][current_user] = chat["gay_stats"].get(current_user, 0) + 1
-                # Записываем решение
-                chat["current_gathering"][current_user] = {"display": display_name, "vote": vote}
+                # uid нужен, чтобы найти привязанный Steam и показать ранг в списке
+                chat["current_gathering"][current_user] = {
+                    "display": display_name, "vote": vote, "uid": str(callback.from_user.id)}
                 result = "accepted"
             current_gathering = copy.deepcopy(chat["current_gathering"])
+            links = dict(chat["links"])
 
     if result == "not_in_team":
         await answer_callback(callback, "403: Тебя нет в списке!", show_alert=True)
@@ -994,7 +1023,7 @@ async def handle_vote(callback: types.CallbackQuery):
 
     try:
         await callback.message.edit_text(
-            get_gathering_text(current_gathering),
+            await get_gathering_text(current_gathering, links),
             reply_markup=get_keyboard(),
             parse_mode="HTML"
         )
@@ -1002,18 +1031,35 @@ async def handle_vote(callback: types.CallbackQuery):
         # Сообщение могли удалить или оно уже с таким же текстом — голос все равно учтен
         print(f"Не удалось обновить список сбора: {e}")
 
-# Очищенная функция без личной статистики
-def get_gathering_text(current_gathering):
+
+async def _plus_line(record: dict, links: dict) -> str:
+    """Ник плюсанувшего, а если он привязал Steam — с рангом в скобках."""
+    name = html.escape(record["display"])
+    account_id = links.get(record.get("uid"))
+    if account_id is not None:
+        try:
+            rank = await get_rank_string(account_id)
+        except Exception:
+            rank = None
+        if rank:
+            name += f" ({html.escape(rank)})"
+    return name
+
+
+async def get_gathering_text(current_gathering, links=None):
+    links = links or {}
     text = "🚨 <b>Играем! Кто идет?</b>\n\n"
 
-    pluses = [data["display"] for data in current_gathering.values() if data["vote"] == "+"]
-    minuses = [data["display"] for data in current_gathering.values() if data["vote"] == "-"]
+    plus_records = [d for d in current_gathering.values() if d["vote"] == "+"]
+    minuses = [html.escape(d["display"]) for d in current_gathering.values() if d["vote"] == "-"]
 
-    if pluses:
-        text += "✅ <b>Играют:</b>\n" + "\n".join(pluses) + "\n\n"
+    if plus_records:
+        # Ранги тянем параллельно; для привязанных они из кэша, для остальных — None
+        plus_lines = await asyncio.gather(*(_plus_line(d, links) for d in plus_records))
+        text += "✅ <b>Играют:</b>\n" + "\n".join(plus_lines) + "\n\n"
     if minuses:
         text += "❌ <b>Гейчики:</b>\n" + "\n".join(minuses) + "\n\n"
-    if not pluses and not minuses:
+    if not plus_records and not minuses:
         text += "Пока никто не отметился. Жмите кнопки!"
     return text
 
