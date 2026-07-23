@@ -4,8 +4,11 @@ services:
     container_name: deadlock_bot
     restart: unless-stopped
     volumes:
-      # Монтируем только папку с данными, чтобы не перекрывать код в /app
+      # Данные — в томе, чтобы переживали пересборку
       - ./data:/app/data
+      # Код монтируем поверх образа: после git pull хватает Restart, без --build.
+      # Меняешь requirements.txt — вот тогда нужен docker compose up -d --build.
+      - ./bot.py:/app/bot.py:ro
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - DATA_DIR=/app/data
