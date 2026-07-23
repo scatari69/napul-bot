@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 
 # Локальные данные бота
+data/
+state.json
 stats.json
 team.json
 user_statistics.json

@@ -4,6 +4,10 @@ services:
     container_name: deadlock_bot
     restart: unless-stopped
     volumes:
-      - ./data:/app
+      # Монтируем только папку с данными, чтобы не перекрывать код в /app
+      - ./data:/app/data
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
+      - DATA_DIR=/app/data
+      # Чат, в котором работают пасхалки (/egg)
+      - EGG_CHAT_ID=${EGG_CHAT_ID:-1179357258}
