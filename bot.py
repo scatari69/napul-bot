@@ -8,6 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -516,10 +517,20 @@ async def clear_gathering(message: types.Message):
         await message.reply("Список и так пуст. 🤔")
 
 # --- Обработчики кнопок (callback) ---
+async def answer_callback(callback: types.CallbackQuery, text: str, show_alert: bool = False):
+    """На нажатие Telegram ждет ответа меньше минуты. Кнопки старого сбора и
+    нажатия, накопившиеся за простой бота, отвечать уже поздно — это штатная
+    ситуация, а не повод ронять обработчик."""
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except TelegramBadRequest as e:
+        print(f"Не удалось ответить на нажатие: {e}")
+
+
 @dp.callback_query(F.data.in_({"vote_plus", "vote_minus"}))
 async def handle_vote(callback: types.CallbackQuery):
     if not callback.from_user.username:
-        await callback.answer("У тебя нет username!", show_alert=True)
+        await answer_callback(callback, "У тебя нет username!", show_alert=True)
         return
 
     current_user = f"@{callback.from_user.username}".lower()
@@ -541,19 +552,26 @@ async def handle_vote(callback: types.CallbackQuery):
             current_gathering = copy.deepcopy(chat["current_gathering"])
 
     if result == "not_in_team":
-        await callback.answer("403: Тебя нет в списке!", show_alert=True)
+        await answer_callback(callback, "403: Тебя нет в списке!", show_alert=True)
         return
 
     if result == "duplicate":
-        await callback.answer("Уже учтено!")
+        await answer_callback(callback, "Уже учтено!")
         return
 
-    await callback.message.edit_text(
-        get_gathering_text(current_gathering),
-        reply_markup=get_keyboard(),
-        parse_mode="HTML"
-    )
-    await callback.answer("Принято!")
+    # Сначала закрываем нажатие, потом перерисовываем: на ответ есть меньше минуты,
+    # а редактирование сообщения может и не успеть в это окно
+    await answer_callback(callback, "Принято!")
+
+    try:
+        await callback.message.edit_text(
+            get_gathering_text(current_gathering),
+            reply_markup=get_keyboard(),
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest as e:
+        # Сообщение могли удалить или оно уже с таким же текстом — голос все равно учтен
+        print(f"Не удалось обновить список сбора: {e}")
 
 # Очищенная функция без личной статистики
 def get_gathering_text(current_gathering):
@@ -627,7 +645,9 @@ async def show_stats(message: types.Message):
 async def main():
     load_state()
     asyncio.create_task(reset_gathering_at_three_am())
-    await dp.start_polling(bot)
+    # Копившиеся за простой апдейты выбрасываем: отвечать на нажатия,
+    # сделанные во время перезапуска, Telegram уже не позволит
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
